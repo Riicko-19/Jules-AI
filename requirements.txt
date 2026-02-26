@@ -1,7 +1,5 @@
 google-adk
-fastapi
-uvicorn
-python-multipart
+python-telegram-bot
 httpx
 PyGithub
 duckduckgo-search

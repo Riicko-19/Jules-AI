@@ -2,9 +2,9 @@ import os
 import logging
 import asyncio
 import subprocess
-import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse
+import tempfile
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
 
 # ADK and GenAI imports
@@ -19,165 +19,81 @@ from agents.manager import MANAGER_AGENT
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
 # Environment Variables
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# WhatsApp API URL
-API_URL = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 
 # Global session service (in-memory)
 session_service = InMemorySessionService()
 
-@app.get("/webhook")
-async def verify_webhook(request: Request):
-    """Verifies the webhook for WhatsApp."""
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles incoming text messages."""
+    user_id = str(update.effective_user.id)
+    session_id = f"session_{user_id}"
+    text_body = update.message.text
 
-    if token == WHATSAPP_TOKEN:
-        return PlainTextResponse(content=challenge)
-    raise HTTPException(status_code=403, detail="Invalid verify token")
+    logger.info(f"Received text message from {user_id}: {text_body}")
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    """Handles incoming WhatsApp messages."""
-    try:
-        data = await request.json()
-        logger.info(f"Received webhook: {data}")
+    content = Content(role="user", parts=[Part(text=text_body)])
+    await process_agent_request(update, content, user_id, session_id)
 
-        # Check for messages
-        entry = data.get("entry", [])
-        if not entry:
-            return {"status": "ok"}
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles incoming voice messages."""
+    user_id = str(update.effective_user.id)
+    session_id = f"session_{user_id}"
 
-        changes = entry[0].get("changes", [])
-        if not changes:
-            return {"status": "ok"}
+    logger.info(f"Received voice message from {user_id}")
 
-        value = changes[0].get("value", {})
-        if "messages" not in value:
-            return {"status": "ok"}
+    voice_file = await context.bot.get_file(update.message.voice.file_id)
 
-        message = value["messages"][0]
-        msg_type = message.get("type")
-        from_number = message.get("from")
+    # Create temporary files for processing
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as temp_ogg:
+        ogg_path = temp_ogg.name
 
-        # Session IDs
-        user_id = from_number
-        session_id = f"session_{from_number}"
+    await voice_file.download_to_drive(ogg_path)
 
-        content = None
+    mp3_path = await convert_audio(ogg_path)
 
-        if msg_type == "text":
-            text_body = message["text"]["body"]
-            content = Content(role="user", parts=[Part(text=text_body)])
+    if mp3_path:
+        try:
+            with open(mp3_path, "rb") as f:
+                audio_data = f.read()
 
-        elif msg_type == "audio":
-            audio_id = message["audio"]["id"]
-
-            # Download and convert audio
-            audio_path = await download_audio(audio_id)
-            if audio_path:
-                converted_path = await convert_audio(audio_path)
-
-                if converted_path:
-                    # Read audio data
-                    with open(converted_path, "rb") as f:
-                        audio_data = f.read()
-
-                    # Create Content with audio blob
-                    # Assuming MP3 format after conversion
-                    content = Content(
-                        role="user",
-                        parts=[
-                            Part(inline_data=Blob(mime_type="audio/mp3", data=audio_data)),
-                            Part(text="Please listen to this audio and respond.")
-                        ]
-                    )
-
-                    # Cleanup
-                    try:
-                        if os.path.exists(audio_path):
-                            os.remove(audio_path)
-                        if os.path.exists(converted_path):
-                            os.remove(converted_path)
-                    except Exception as cleanup_error:
-                        logger.warning(f"Cleanup error: {cleanup_error}")
-
-        if content:
-            # Initialize Runner
-            runner = Runner(
-                agent=MANAGER_AGENT,
-                app_name="whatsapp_assistant",
-                session_service=session_service,
-                auto_create_session=True
+            content = Content(
+                role="user",
+                parts=[
+                    Part(inline_data=Blob(mime_type="audio/mp3", data=audio_data)),
+                    Part(text="Please listen to this audio and respond.")
+                ]
             )
 
-            response_text = ""
-            logger.info(f"Running agent for user {user_id}...")
+            await process_agent_request(update, content, user_id, session_id)
 
-            async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
-                # Check for content in event
-                if event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if part.text:
-                            response_text += part.text
-
-            logger.info(f"Agent response: {response_text}")
-
-            if response_text:
-                await send_whatsapp_message(from_number, response_text)
-
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        import traceback
-        traceback.print_exc()
-
-    return {"status": "ok"}
-
-async def download_audio(media_id: str) -> str:
-    """Downloads audio from WhatsApp."""
-    try:
-        url = f"https://graph.facebook.com/v19.0/{media_id}"
-        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-
-        async with httpx.AsyncClient() as client:
-            # Get Media URL
-            response = await client.get(url, headers=headers)
-            if response.status_code != 200:
-                 logger.error(f"Failed to get media info: {response.text}")
-                 return None
-
-            media_url = response.json().get("url")
-
-            # Download Media
-            # Note: Media URL might require Authorization header as well, usually the same one.
-            response = await client.get(media_url, headers=headers)
-            if response.status_code != 200:
-                 logger.error(f"Failed to download media: {response.text}")
-                 return None
-
-            filename = f"{media_id}.ogg"
-            with open(filename, "wb") as f:
-                f.write(response.content)
-
-            return filename
-    except Exception as e:
-        logger.error(f"Error in download_audio: {e}")
-        return None
+        except Exception as e:
+            logger.error(f"Error processing audio file: {e}")
+            await update.message.reply_text("Sorry, I encountered an error processing your voice message.")
+        finally:
+            # Cleanup
+            try:
+                if os.path.exists(ogg_path):
+                    os.remove(ogg_path)
+                if os.path.exists(mp3_path):
+                    os.remove(mp3_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Cleanup error: {cleanup_error}")
+    else:
+        await update.message.reply_text("Sorry, I could not process the audio format.")
 
 async def convert_audio(input_path: str) -> str:
     """Converts audio to MP3 using ffmpeg."""
     output_path = input_path.replace(".ogg", ".mp3")
     try:
-        # Check if ffmpeg is available
         process = await asyncio.create_subprocess_exec(
             'ffmpeg', '-i', input_path, '-y', output_path,
             stdout=asyncio.subprocess.PIPE,
@@ -194,23 +110,50 @@ async def convert_audio(input_path: str) -> str:
         logger.error(f"Error converting audio: {e}")
         return None
 
-async def send_whatsapp_message(to: str, text: str):
-    """Sends a text message via WhatsApp API."""
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text}
-    }
+async def process_agent_request(update: Update, content: Content, user_id: str, session_id: str):
+    """Runs the agent and sends the response back to Telegram."""
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(API_URL, headers=headers, json=payload)
-            logger.info(f"Sent message to {to}, status: {response.status_code}")
-            if response.status_code not in [200, 201]:
-                logger.error(f"Response body: {response.text}")
+        # Initialize Runner
+        runner = Runner(
+            agent=MANAGER_AGENT,
+            app_name="telegram_assistant",
+            session_service=session_service,
+            auto_create_session=True
+        )
+
+        response_text = ""
+        logger.info(f"Running agent for user {user_id}...")
+
+        # Stream response
+        async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        response_text += part.text
+
+        logger.info(f"Agent response: {response_text}")
+
+        if response_text:
+            await update.message.reply_text(response_text)
+        else:
+             await update.message.reply_text("I didn't have anything to say.")
+
     except Exception as e:
-        logger.error(f"Error sending message: {e}")
+        logger.error(f"Error running agent: {e}")
+        await update.message.reply_text("Sorry, I encountered an error processing your request.")
+
+if __name__ == '__main__':
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not found in environment variables.")
+        exit(1)
+
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    text_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text)
+    voice_handler = MessageHandler(filters.VOICE, handle_voice)
+
+    application.add_handler(text_handler)
+    application.add_handler(voice_handler)
+
+    logger.info("Bot is running...")
+    application.run_polling()
