@@ -1,0 +1,8 @@
+google-adk
+fastapi
+uvicorn
+python-multipart
+httpx
+PyGithub
+duckduckgo-search
+python-dotenv
